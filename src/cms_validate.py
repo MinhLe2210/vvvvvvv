@@ -1,0 +1,294 @@
+import json
+import traceback
+from typing import Any
+
+import httpx
+from openai import OpenAI
+from pydantic import BaseModel
+
+from src import configs
+from src.utils import (
+    ErrorCodes,
+    LocalTopic,
+    LocationResult,
+    OutputValidation,
+    SEVERITY_MAPPING,
+    ValidationResult,
+    logging_service,
+)
+
+
+PROMPT_LIKE_TOPICS = {
+    LocalTopic.ALERT.value,
+    LocalTopic.SOCIAL_ORDER.value,
+    LocalTopic.SAR.value,
+    LocalTopic.ACCIDENT.value,
+    LocalTopic.COMPLAINT.value,
+    LocalTopic.SECURITY.value,
+    LocalTopic.CHILD.value,
+    LocalTopic.SANITATION_POLLUTION.value,
+    LocalTopic.CYBERSECURITY.value,
+    LocalTopic.MOVEMENT.value,
+}
+
+
+class CMSValidator:
+    def __init__(self):
+        self.time_out = configs.TIMEOUT
+        self.max_try = configs.MAX_TRY
+        self.openai_client = self._build_client()
+        self.update_cache()
+
+    def _build_client(self):
+        if not configs.OPENAI_API_KEY:
+            logging_service.warning("OPENAI_API_KEY is empty. LLM calls will fail.")
+            return None
+
+        http_client = None
+        if configs.OPENAI_PROXY:
+            http_client = httpx.Client(proxy=configs.OPENAI_PROXY)
+
+        return OpenAI(
+            api_key=configs.OPENAI_API_KEY,
+            http_client=http_client,
+            timeout=self.time_out,
+        )
+
+    def _load_json(self, path):
+        return configs.load_json(path)
+
+    def _save_json(self, path, data: dict):
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=4)
+
+    def update_cache(self):
+        self.cms_location = self._load_json(configs.LOCATION_PATH)
+        self.prompt_location = self._load_json(configs.PROMPT_PATH)
+        self.prompt_custom = self._load_json(configs.CUSTOM_PROMPT_PATH)
+        self.prompt_severity = self._load_json(configs.SEVERITY_PROMPT_PATH)
+        self.model_name = self.prompt_location.get("model_name", {})
+        self.model_default = self.model_name.get("default", configs.MODEL_DEFAULT)
+
+    def save_prompt(self, key: str, value: str):
+        data = self._load_json(configs.PROMPT_PATH)
+        data[key] = value
+        self._save_json(configs.PROMPT_PATH, data)
+        self.update_cache()
+
+    def get_prompt(self, key: str):
+        self.update_cache()
+        return self.prompt_location.get(key, "")
+
+    def get_places(self, event_id: str):
+        self.update_cache()
+        return self.cms_location.get(event_id)
+
+    def llm_parser(
+        self,
+        content: str,
+        entity: type[BaseModel],
+        model_name: str,
+        system_prompt: str,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        if self.openai_client is None:
+            return {
+                "request_id": request_id,
+                "llm": {},
+                "error": "OPENAI_API_KEY is empty",
+            }
+
+        msg = ""
+        for _ in range(self.max_try):
+            try:
+                response = self.openai_client.responses.parse(
+                    model=model_name,
+                    input=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": content},
+                    ],
+                    text_format=entity,
+                    temperature=0.1,
+                    top_p=0.95,
+                    timeout=self.time_out,
+                )
+                parsed = response.output_parsed
+                return {"request_id": request_id, "llm": parsed.model_dump()}
+            except Exception:
+                msg = traceback.format_exc()
+                logging_service.error(msg)
+
+        return {"request_id": request_id, "llm": {}, "error": msg}
+
+    def llm_text(
+        self,
+        content: str,
+        system_prompt: str,
+        model_name: str | None = None,
+    ) -> dict[str, Any]:
+        if self.openai_client is None:
+            return {"text": "", "error": "OPENAI_API_KEY is empty"}
+
+        model_name = model_name or self.model_default
+        msg = ""
+        for _ in range(self.max_try):
+            try:
+                response = self.openai_client.responses.create(
+                    model=model_name,
+                    input=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": content},
+                    ],
+                    temperature=0.1,
+                    top_p=0.95,
+                    timeout=self.time_out,
+                )
+                return {"text": response.output_text, "error": ""}
+            except Exception:
+                msg = traceback.format_exc()
+                logging_service.error(msg)
+
+        return {"text": "", "error": msg}
+
+    def validate_local(
+        self,
+        text: str,
+        event_id: str,
+        places: str,
+        output: OutputValidation,
+        location_prompt_override: str | None = None,
+    ):
+        location_prompt = location_prompt_override or self.prompt_location[configs.LOCATION]
+        llm_location = self.llm_parser(
+            content=text,
+            entity=LocationResult,
+            model_name=self.model_name.get(configs.LOCATION, self.model_default),
+            system_prompt=f"{location_prompt}{places}",
+            request_id=output.request_id,
+        )
+        output.result_detail["location_parser"] = llm_location.get("llm", {})
+        if llm_location.get("error"):
+            output.result_detail["location_error"] = llm_location["error"]
+
+        if not llm_location.get("llm"):
+            output.set_error(ErrorCodes.OPENAI_ERROR)
+            output.description = llm_location.get("error") or output.description
+            return output
+
+        is_valid_loc = llm_location["llm"].get("location")
+        topic = llm_location["llm"].get("topic")
+        output.location = is_valid_loc
+        output.topic = topic
+        output.result = False
+
+        if not is_valid_loc or not topic:
+            return output
+
+        if topic == LocalTopic.KNOWN.value and self.prompt_location.get(LocalTopic.KNOWN.value):
+            llm_known = self.llm_parser(
+                content=text,
+                entity=ValidationResult,
+                model_name=self.model_name.get(LocalTopic.KNOWN.value, self.model_default),
+                system_prompt=self.prompt_location[LocalTopic.KNOWN.value],
+                request_id=output.request_id,
+            )
+            output.result_detail["topic_validation"] = llm_known.get("llm", {})
+            return output
+
+        if topic not in PROMPT_LIKE_TOPICS:
+            return output
+
+        topic_prompt = self.prompt_location.get(topic)
+        severity_entity = SEVERITY_MAPPING.get(topic)
+        severity_prompt = self.prompt_severity.get(topic)
+        if not topic_prompt or severity_entity is None or not severity_prompt:
+            output.set_error(ErrorCodes.CONFIG_ERROR)
+            return output
+
+        llm_topic = self.llm_parser(
+            content=text,
+            entity=ValidationResult,
+            model_name=self.model_name.get(topic, self.model_default),
+            system_prompt=topic_prompt,
+            request_id=output.request_id,
+        )
+        topic_result = llm_topic.get("llm", {}).get("result")
+        output.result_detail["topic_validation"] = llm_topic.get("llm", {})
+        if llm_topic.get("error"):
+            output.result_detail["topic_error"] = llm_topic["error"]
+
+        if topic_result is None:
+            output.set_error(ErrorCodes.OPENAI_ERROR)
+            output.description = llm_topic.get("error") or output.description
+            return output
+
+        if not topic_result:
+            output.result = False
+            return output
+
+        output.result = True
+        llm_severity = self.llm_parser(
+            content=text,
+            entity=severity_entity,
+            model_name=configs.MODEL_SEVERITY,
+            system_prompt=severity_prompt,
+            request_id=output.request_id,
+        )
+        output.result_detail["severity_parser"] = llm_severity.get("llm", {})
+        if llm_severity.get("error"):
+            output.result_detail["severity_error"] = llm_severity["error"]
+        severity = llm_severity.get("llm", {}).get("severity")
+        if severity is None:
+            output.set_error(ErrorCodes.OPENAI_ERROR)
+            output.description = llm_severity.get("error") or output.description
+            return output
+
+        output.severity = severity
+        return output
+
+    def validate_cms(
+        self,
+        content: str,
+        title: str,
+        description: str,
+        display_name: str,
+        event_id: str,
+        places_override: str | None = None,
+        location_prompt_override: str | None = None,
+        **kwargs,
+    ):
+        output = OutputValidation(request_id=kwargs.get("request_id", ""))
+        text = f"{title}\n{description}\n{display_name}\n{content}".strip()
+        custom_prompt = self.prompt_custom.get(event_id)
+        places = places_override or self.cms_location.get(event_id)
+
+        if not text:
+            output.set_error(ErrorCodes.CONTENT_ERROR)
+            return output
+
+        if custom_prompt:
+            llm = self.llm_parser(
+                content=text,
+                entity=ValidationResult,
+                model_name=self.model_default,
+                system_prompt=custom_prompt,
+                request_id=output.request_id,
+            )
+            if llm.get("llm"):
+                output.result = llm["llm"]["result"]
+            else:
+                output.set_error(ErrorCodes.OPENAI_ERROR)
+                output.description = llm.get("error") or output.description
+            return output
+
+        if not places:
+            output.set_error(ErrorCodes.EVENT_ERROR)
+            return output
+
+        return self.validate_local(
+            text=text,
+            event_id=event_id,
+            places=places,
+            output=output,
+            location_prompt_override=location_prompt_override,
+        )
