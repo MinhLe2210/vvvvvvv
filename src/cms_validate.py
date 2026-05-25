@@ -1,3 +1,5 @@
+# cms_validate.py
+
 import json
 import traceback
 from typing import Any
@@ -158,7 +160,23 @@ class CMSValidator:
         output: OutputValidation,
         location_prompt_override: str | None = None,
     ):
+        logging_service.info(
+            "[validate_local] start request_id=%s event_id=%s text_len=%s places_len=%s override_prompt=%s",
+            output.request_id,
+            event_id,
+            len(text or ""),
+            len(places or ""),
+            bool(location_prompt_override),
+        )
+
         location_prompt = location_prompt_override or self.prompt_location[configs.LOCATION]
+
+        logging_service.info(
+            "[validate_local] running location parser request_id=%s model=%s",
+            output.request_id,
+            self.model_name.get(configs.LOCATION, self.model_default),
+        )
+
         llm_location = self.llm_parser(
             content=text,
             entity=LocationResult,
@@ -166,13 +184,24 @@ class CMSValidator:
             system_prompt=f"{location_prompt}{places}",
             request_id=output.request_id,
         )
+
         output.result_detail["location_parser"] = llm_location.get("llm", {})
         if llm_location.get("error"):
             output.result_detail["location_error"] = llm_location["error"]
+            logging_service.info(
+                "[validate_local] location parser error request_id=%s error=%s",
+                output.request_id,
+                llm_location["error"],
+            )
 
         if not llm_location.get("llm"):
             output.set_error(ErrorCodes.OPENAI_ERROR)
             output.description = llm_location.get("error") or output.description
+            logging_service.info(
+                "[validate_local] stop: empty location llm request_id=%s description=%s",
+                output.request_id,
+                output.description,
+            )
             return output
 
         is_valid_loc = llm_location["llm"].get("location")
@@ -181,10 +210,30 @@ class CMSValidator:
         output.topic = topic
         output.result = False
 
+        logging_service.info(
+            "[validate_local] location parsed request_id=%s location=%s topic=%s",
+            output.request_id,
+            is_valid_loc,
+            topic,
+        )
+
         if not is_valid_loc or not topic:
+            logging_service.info(
+                "[validate_local] stop: invalid location/topic request_id=%s location=%s topic=%s",
+                output.request_id,
+                is_valid_loc,
+                topic,
+            )
             return output
 
         if topic == LocalTopic.KNOWN.value and self.prompt_location.get(LocalTopic.KNOWN.value):
+            logging_service.info(
+                "[validate_local] running known topic validation request_id=%s topic=%s model=%s",
+                output.request_id,
+                topic,
+                self.model_name.get(LocalTopic.KNOWN.value, self.model_default),
+            )
+
             llm_known = self.llm_parser(
                 content=text,
                 entity=ValidationResult,
@@ -193,18 +242,44 @@ class CMSValidator:
                 request_id=output.request_id,
             )
             output.result_detail["topic_validation"] = llm_known.get("llm", {})
+
+            logging_service.info(
+                "[validate_local] done known topic validation request_id=%s llm=%s",
+                output.request_id,
+                llm_known.get("llm", {}),
+            )
             return output
 
         if topic not in PROMPT_LIKE_TOPICS:
+            logging_service.info(
+                "[validate_local] stop: topic does not need prompt validation request_id=%s topic=%s",
+                output.request_id,
+                topic,
+            )
             return output
 
         topic_prompt = self.prompt_location.get(topic)
         severity_entity = SEVERITY_MAPPING.get(topic)
         severity_prompt = self.prompt_severity.get(topic)
+
         if not topic_prompt or severity_entity is None or not severity_prompt:
             output.set_error(ErrorCodes.CONFIG_ERROR)
+            logging_service.info(
+                "[validate_local] stop: config error request_id=%s topic=%s has_topic_prompt=%s has_severity_entity=%s has_severity_prompt=%s",
+                output.request_id,
+                topic,
+                bool(topic_prompt),
+                severity_entity is not None,
+                bool(severity_prompt),
+            )
             return output
 
+        logging_service.info(
+            "[validate_local] running topic validation request_id=%s topic=%s model=%s",
+            output.request_id,
+            topic,
+            self.model_name.get(topic, self.model_default),
+        )
         llm_topic = self.llm_parser(
             content=text,
             entity=ValidationResult,
@@ -212,21 +287,55 @@ class CMSValidator:
             system_prompt=topic_prompt,
             request_id=output.request_id,
         )
+
         topic_result = llm_topic.get("llm", {}).get("result")
         output.result_detail["topic_validation"] = llm_topic.get("llm", {})
+
         if llm_topic.get("error"):
             output.result_detail["topic_error"] = llm_topic["error"]
+            logging_service.info(
+                "[validate_local] topic validation error request_id=%s topic=%s error=%s",
+                output.request_id,
+                topic,
+                llm_topic["error"],
+            )
+
+        logging_service.info(
+            "[validate_local] topic validation parsed request_id=%s topic=%s result=%s",
+            output.request_id,
+            topic,
+            topic_result,
+        )
 
         if topic_result is None:
             output.set_error(ErrorCodes.OPENAI_ERROR)
             output.description = llm_topic.get("error") or output.description
+            logging_service.info(
+                "[validate_local] stop: topic result is None request_id=%s description=%s",
+                output.request_id,
+                output.description,
+            )
             return output
 
         if not topic_result:
             output.result = False
+            logging_service.info(
+                "[validate_local] stop: topic result false request_id=%s topic=%s",
+                output.request_id,
+                topic,
+            )
             return output
 
         output.result = True
+
+        logging_service.info(
+            "[validate_local] running severity parser request_id=%s topic=%s model=%s entity=%s",
+            output.request_id,
+            topic,
+            configs.MODEL_SEVERITY,
+            severity_entity.__name__,
+        )
+
         llm_severity = self.llm_parser(
             content=text,
             entity=severity_entity,
@@ -234,16 +343,49 @@ class CMSValidator:
             system_prompt=severity_prompt,
             request_id=output.request_id,
         )
+
         output.result_detail["severity_parser"] = llm_severity.get("llm", {})
+
         if llm_severity.get("error"):
             output.result_detail["severity_error"] = llm_severity["error"]
+            logging_service.info(
+                "[validate_local] severity parser error request_id=%s topic=%s error=%s",
+                output.request_id,
+                topic,
+                llm_severity["error"],
+            )
+
         severity = llm_severity.get("llm", {}).get("severity")
+
+        logging_service.info(
+            "[validate_local] severity parsed request_id=%s topic=%s severity=%s",
+            output.request_id,
+            topic,
+            severity,
+        )
+
         if severity is None:
             output.set_error(ErrorCodes.OPENAI_ERROR)
             output.description = llm_severity.get("error") or output.description
+            logging_service.info(
+                "[validate_local] stop: severity is None request_id=%s description=%s",
+                output.request_id,
+                output.description,
+            )
             return output
 
         output.severity = severity
+
+        logging_service.info(
+            "[validate_local] done request_id=%s event_id=%s location=%s topic=%s result=%s severity=%s",
+            output.request_id,
+            event_id,
+            output.location,
+            output.topic,
+            output.result,
+            output.severity,
+        )
+
         return output
 
     def validate_cms(

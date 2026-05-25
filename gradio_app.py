@@ -1,6 +1,7 @@
+# gradio_app.py
 import json
 import traceback
-
+import tempfile
 import gradio as gr
 
 from src.cms_validate import CMSValidator
@@ -13,19 +14,19 @@ from src.utils import (
     SeverityResult4Lv,
     ValidationResult,
 )
-
+from src import configs 
 
 validator = CMSValidator()
 
 
 SCHEMA_MAPPING = {
+    "RawText": ("raw", None),
     "LocationResult": ("structured", None),
     "ValidationResult": ("structured", ValidationResult),
     "SeverityResult2Lv": ("structured", SeverityResult2Lv),
     "SeverityResult3Lv": ("structured", SeverityResult3Lv),
     "SeverityResult3Lv2": ("structured", SeverityResult3Lv2),
     "SeverityResult4Lv": ("structured", SeverityResult4Lv),
-    "RawText": ("raw", None),
 }
 
 
@@ -51,29 +52,39 @@ def show_places(event_id):
     return places or ""
 
 
-def save_location_prompt(prompt_text):
+def download_location_prompt(prompt_text):
     if not prompt_text.strip():
-        return "Prompt rỗng, chưa lưu."
-    validator.save_prompt("Location", prompt_text)
-    return "Đã lưu `cms_prompt.json[\"Location\"]` và reload cache."
+        return None, "Prompt rỗng, chưa tạo file download."
+
+    data = validator._load_json(configs.PROMPT_PATH)
+    data["Location"] = prompt_text
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix="cms_prompt_edited_",
+        delete=False,
+        encoding="utf-8",
+    )
+    with tmp:
+        json.dump(data, tmp, ensure_ascii=False, indent=4)
+
+    return tmp.name, "Đã tạo file prompt đã sửa. Bấm Download để tải về."
 
 
 def run_validation(
     event_id,
     request_id,
-    title,
-    description,
-    display_name,
     content,
     places_override,
     location_prompt_text,
 ):
     try:
         output = validator.validate_cms(
-            title=title,
-            description=description,
-            display_name=display_name,
-            content=content,
+            title="",
+            description="",
+            display_name="",
+            content=content or "",
             event_id=event_id or "",
             request_id=request_id or "",
             places_override=places_override or None,
@@ -166,22 +177,23 @@ def build_demo():
 
                 with gr.Column(scale=2):
                     location_prompt = gr.Textbox(
-                        label='cms_prompt.json["Location"]',
+                        label='Chỉnh sửa prompt ở dưới:',
                         lines=24,
                         value=validator.get_prompt("Location"),
                     )
                     with gr.Row():
-                        refresh_prompt_btn = gr.Button("Reload prompt file")
-                        save_prompt_btn = gr.Button("Save prompt")
-                        run_btn = gr.Button("Run validation", variant="primary")
-                    save_status = gr.Textbox(label="Save status", interactive=False)
+                        download_prompt_btn = gr.Button("Download prompt đã sửa")
+                        run_btn = gr.Button("Nhấn để chạy thử prompt", variant="primary")
+                    prompt_file = gr.File(label="Prompt file", interactive=False)
+                    save_status = gr.Textbox(label="Download status", interactive=False)
 
             with gr.Row():
                 with gr.Column():
-                    title = gr.Textbox(label="Title")
-                    description = gr.Textbox(label="Description", lines=4)
-                    display_name = gr.Textbox(label="Display name")
-                    content = gr.Textbox(label="Content", lines=12)
+                    content = gr.Textbox(
+                        label="Content",
+                        lines=12,
+                        placeholder="Điền vào nội dung để phân loại"
+                        )
                 with gr.Column():
                     location_value = gr.Textbox(label="location", interactive=False)
                     topic_value = gr.Textbox(
@@ -195,16 +207,18 @@ def build_demo():
 
             event_id.change(show_places, inputs=[event_id], outputs=[mapped_places])
             refresh_event.click(refresh_event_choices, outputs=[event_id])
-            refresh_prompt_btn.click(refresh_location_prompt, outputs=[location_prompt])
-            save_prompt_btn.click(save_location_prompt, inputs=[location_prompt], outputs=[save_status])
+            # refresh_prompt_btn.click(refresh_location_prompt, outputs=[location_prompt])
+            download_prompt_btn.click(
+                download_location_prompt,
+                inputs=[location_prompt],
+                outputs=[prompt_file, save_status],
+            )
+
             run_btn.click(
                 run_validation,
                 inputs=[
                     event_id,
                     request_id,
-                    title,
-                    description,
-                    display_name,
                     content,
                     places_override,
                     location_prompt,
@@ -220,17 +234,14 @@ def build_demo():
                 ],
             )
 
+
         with gr.Tab("Custom Prompt Lab"):
             with gr.Row():
                 with gr.Column(scale=1):
                     schema_name = gr.Dropdown(
                         label="Schema",
                         choices=list(SCHEMA_MAPPING.keys()),
-                        value="LocationResult",
-                    )
-                    model_name = gr.Textbox(
-                        label="Model name",
-                        value=validator.model_default,
+                        value="RawText",
                     )
                     run_custom_btn = gr.Button("Run prompt", variant="primary")
                 with gr.Column(scale=2):
@@ -241,6 +252,7 @@ def build_demo():
                 with gr.Column():
                     custom_output = gr.Code(label="Result", language="json")
 
+            model_name = gr.State("gpt-4.1-mini")
             run_custom_btn.click(
                 run_prompt_lab,
                 inputs=[custom_prompt, custom_content, schema_name, model_name],
