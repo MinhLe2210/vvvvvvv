@@ -114,7 +114,7 @@ def _content_column_name(fieldnames: list[str]) -> str:
     raise ValueError(f"CSV phải có cột 'content'. Các cột hiện có: {columns}")
 
 
-def _read_csv(file_obj, row_limit: int) -> list[str]:
+def _read_csv(file_obj) -> list[str]:
     path = _file_path(file_obj)
     if path is None:
         raise ValueError("Chưa chọn file CSV.")
@@ -131,8 +131,6 @@ def _read_csv(file_obj, row_limit: int) -> list[str]:
                 contents = []
                 for row in reader:
                     contents.append(str(row.get(content_column) or "").strip())
-                    if row_limit > 0 and len(contents) >= row_limit:
-                        break
                 return contents
         except UnicodeDecodeError as exc:
             last_error = exc
@@ -211,15 +209,12 @@ def _stage_1_prompt_with_places(stage_1_prompt: str, places_override: str | None
 
 def run_csv_batch(
     csv_file,
-    model_name,
-    row_limit,
     places_override,
     stage_1_prompt,
     *topic_prompt_values,
 ):
     try:
-        row_limit = int(row_limit or 0)
-        model_name = (model_name or validator.model_default).strip()
+        model_name = validator.model_default
         stage_1_prompt = (stage_1_prompt or "").strip()
         if not stage_1_prompt:
             return [], None, None, "Prompt bước 1 đang trống."
@@ -229,7 +224,7 @@ def run_csv_batch(
             topic: (prompt or "").strip()
             for topic, prompt in zip(TOPIC_ORDER, topic_prompt_values)
         }
-        contents = _read_csv(csv_file, row_limit)
+        contents = _read_csv(csv_file)
 
         rows = []
         errors = []
@@ -349,15 +344,6 @@ def build_demo():
                         type="filepath",
                     )
                 with gr.Column(scale=2):
-                    model_name = gr.Textbox(
-                        label="Model",
-                        value=validator.model_default,
-                    )
-                    row_limit = gr.Number(
-                        label="Giới hạn số dòng (0 = tất cả)",
-                        value=0,
-                        precision=0,
-                    )
                     places_override = gr.Textbox(
                         label="Places override",
                         lines=3,
@@ -423,8 +409,6 @@ def build_demo():
                 run_csv_batch,
                 inputs=[
                     csv_file,
-                    model_name,
-                    row_limit,
                     places_override,
                     stage_1_prompt,
                     *prompt_inputs,
