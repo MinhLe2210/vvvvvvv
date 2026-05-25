@@ -105,14 +105,19 @@ def _file_path(file_obj) -> Path | None:
     return Path(name) if name else None
 
 
-def _read_csv(file_obj, content_column: str, row_limit: int) -> list[str]:
+def _content_column_name(fieldnames: list[str]) -> str:
+    for fieldname in fieldnames:
+        if fieldname and fieldname.strip().lower() == "content":
+            return fieldname
+
+    columns = ", ".join(fieldnames)
+    raise ValueError(f"CSV phải có cột 'content'. Các cột hiện có: {columns}")
+
+
+def _read_csv(file_obj, row_limit: int) -> list[str]:
     path = _file_path(file_obj)
     if path is None:
         raise ValueError("Chưa chọn file CSV.")
-
-    content_column = (content_column or "content").strip()
-    if not content_column:
-        raise ValueError("Tên cột content không được để trống.")
 
     last_error = None
     for encoding in ("utf-8-sig", "utf-8", "cp1258", "latin-1"):
@@ -121,11 +126,7 @@ def _read_csv(file_obj, content_column: str, row_limit: int) -> list[str]:
                 reader = csv.DictReader(file)
                 if not reader.fieldnames:
                     raise ValueError("File CSV không có header.")
-                if content_column not in reader.fieldnames:
-                    columns = ", ".join(reader.fieldnames)
-                    raise ValueError(
-                        f"Không tìm thấy cột '{content_column}'. Các cột hiện có: {columns}"
-                    )
+                content_column = _content_column_name(reader.fieldnames)
 
                 contents = []
                 for row in reader:
@@ -156,6 +157,36 @@ def _write_result_csv(rows: list[list[Any]]) -> str:
     return tmp.name
 
 
+def _write_prompt_csv(
+    places_override: str | None,
+    stage_1_prompt: str,
+    topic_prompt_values: tuple[Any, ...],
+) -> str:
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".csv",
+        prefix="cms_prompts_edited_",
+        delete=False,
+        encoding="utf-8-sig",
+        newline="",
+    )
+    with tmp:
+        writer = csv.writer(tmp)
+        writer.writerow(["step", "topic", "label", "prompt"])
+        writer.writerow(["stage_1", "", "Prompt bước 1", stage_1_prompt or ""])
+        writer.writerow(["places_override", "", "Places override", places_override or ""])
+        for topic, prompt in zip(TOPIC_ORDER, topic_prompt_values):
+            writer.writerow(
+                [
+                    "stage_2",
+                    topic,
+                    TOPIC_LABELS_VI.get(topic, topic),
+                    prompt or "",
+                ]
+            )
+    return tmp.name
+
+
 def _to_row_value(value: Any):
     if value is None:
         return None
@@ -164,11 +195,25 @@ def _to_row_value(value: Any):
     return str(value)
 
 
+def _stage_1_prompt_with_places(stage_1_prompt: str, places_override: str | None) -> str:
+    places_override = (places_override or "").strip()
+    if not places_override:
+        return stage_1_prompt
+
+    return (
+        f"{stage_1_prompt}\n\n"
+        "Bổ sung yêu cầu places override:\n"
+        "Chỉ trả location=true nếu nội dung liên quan trực tiếp tới một trong các địa điểm dưới đây. "
+        "Nếu nội dung có địa điểm khác nhưng không khớp danh sách này, trả location=false.\n\n"
+        f"Địa điểm cần kiểm tra:\n{places_override}"
+    )
+
+
 def run_csv_batch(
     csv_file,
-    content_column,
     model_name,
     row_limit,
+    places_override,
     stage_1_prompt,
     *topic_prompt_values,
 ):
@@ -177,13 +222,14 @@ def run_csv_batch(
         model_name = (model_name or validator.model_default).strip()
         stage_1_prompt = (stage_1_prompt or "").strip()
         if not stage_1_prompt:
-            return [], None, "Prompt bước 1 đang trống."
+            return [], None, None, "Prompt bước 1 đang trống."
+        stage_1_prompt = _stage_1_prompt_with_places(stage_1_prompt, places_override)
 
         topic_prompts = {
             topic: (prompt or "").strip()
             for topic, prompt in zip(TOPIC_ORDER, topic_prompt_values)
         }
-        contents = _read_csv(csv_file, content_column, row_limit)
+        contents = _read_csv(csv_file, row_limit)
 
         rows = []
         errors = []
@@ -247,9 +293,16 @@ def run_csv_batch(
             if len(errors) > 5:
                 status += "..."
 
-        return rows, output_file, status
+        return rows, output_file, output_file, status
     except Exception:
-        return [], None, traceback.format_exc()
+        return [], None, None, traceback.format_exc()
+
+
+def download_prompt_csv(places_override, stage_1_prompt, *topic_prompt_values):
+    try:
+        return _write_prompt_csv(places_override, stage_1_prompt or "", topic_prompt_values)
+    except Exception:
+        return None
 
 
 def run_prompt_lab(system_prompt, content, schema_name, model_name):
@@ -296,10 +349,6 @@ def build_demo():
                         type="filepath",
                     )
                 with gr.Column(scale=2):
-                    content_column = gr.Textbox(
-                        label="Tên cột content",
-                        value="content",
-                    )
                     model_name = gr.Textbox(
                         label="Model",
                         value=validator.model_default,
@@ -308,6 +357,11 @@ def build_demo():
                         label="Giới hạn số dòng (0 = tất cả)",
                         value=0,
                         precision=0,
+                    )
+                    places_override = gr.Textbox(
+                        label="Places override",
+                        lines=3,
+                        placeholder="Nhập nhanh tỉnh/thành để test prompt bước 1. VD: Hà Nội, TP.HCM, Đà Nẵng",
                     )
 
             with gr.Accordion("Prompt bước 1: result places + label", open=True):
@@ -340,6 +394,17 @@ def build_demo():
             with gr.Row():
                 run_btn = gr.Button("Chạy CSV", variant="primary")
                 output_file = gr.File(label="File kết quả", interactive=False)
+                download_result_btn = gr.DownloadButton(
+                    "Download CSV kết quả",
+                    value=None,
+                    variant="secondary",
+                )
+                download_prompts_btn = gr.DownloadButton(
+                    "Download CSV prompts đã sửa",
+                    value=download_prompt_csv,
+                    inputs=[places_override, stage_1_prompt, *prompt_inputs],
+                    variant="secondary",
+                )
 
             status = gr.Textbox(
                 label="Trạng thái",
@@ -358,13 +423,13 @@ def build_demo():
                 run_csv_batch,
                 inputs=[
                     csv_file,
-                    content_column,
                     model_name,
                     row_limit,
+                    places_override,
                     stage_1_prompt,
                     *prompt_inputs,
                 ],
-                outputs=[result_table, output_file, status],
+                outputs=[result_table, output_file, download_result_btn, status],
             )
 
         with gr.Tab("Custom Prompt Lab"):
