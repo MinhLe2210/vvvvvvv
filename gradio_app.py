@@ -1,7 +1,10 @@
-# gradio_app.py
+import csv
 import json
-import traceback
 import tempfile
+import traceback
+from pathlib import Path
+from typing import Any
+
 import gradio as gr
 
 from src.cms_validate import CMSValidator
@@ -14,14 +17,55 @@ from src.utils import (
     SeverityResult4Lv,
     ValidationResult,
 )
-from src import configs 
+
 
 validator = CMSValidator()
 
 
+TOPIC_ORDER = [topic.value for topic in LocalTopic]
+
+TOPIC_LABELS_VI = {
+    LocalTopic.KNOWN.value: "Đã xử lý",
+    LocalTopic.ALERT.value: "Cảnh báo",
+    LocalTopic.SOCIAL_ORDER.value: "Trật tự xã hội",
+    LocalTopic.SAR.value: "PCCC và cứu hộ cứu nạn",
+    LocalTopic.ACCIDENT.value: "Tai nạn giao thông",
+    LocalTopic.COMPLAINT.value: "Khiếu nại tố cáo",
+    LocalTopic.SECURITY.value: "An ninh chính trị",
+    LocalTopic.CHILD.value: "Bảo vệ trẻ em",
+    LocalTopic.FICTION.value: "Hư cấu / giải trí",
+    LocalTopic.SANITATION_POLLUTION.value: "Môi trường, an toàn thực phẩm",
+    LocalTopic.CYBERSECURITY.value: "An ninh mạng",
+    LocalTopic.MOVEMENT.value: "Phong trào toàn dân",
+    LocalTopic.OTHER.value: "Khác",
+}
+
+DEFAULT_STAGE_1_PROMPT = """Bạn là một hệ thống phân loại nội dung tiếng Việt.
+
+Với mỗi nội dung đầu vào, hãy thực hiện 2 việc:
+1. Xác định nội dung có nhắc tới địa điểm/khu vực cụ thể liên quan trực tiếp tới sự việc hay không. Trả về location=true nếu có, location=false nếu không có.
+2. Gán đúng một nhãn chính trong danh sách sau:
+- Known: Sự vụ đã được công an, cảnh sát, cơ quan có thẩm quyền xử lý, can thiệp, bắt giữ, triệt phá, khởi tố, xét xử, tạm giam, phúc thẩm hoặc xử phạt.
+- Alert: Cảnh báo lừa đảo, cảnh báo thiên tai hoặc cảnh báo rủi ro.
+- Social Order: Trật tự xã hội như giết người, đánh nhau, gây rối, mua bán vũ khí, tiền giả, giấy tờ giả, lừa đảo, tín dụng đen, mua bán dữ liệu, mua bán người, đua xe, cờ bạc, tà đạo.
+- SAR: Phòng cháy chữa cháy và cứu hộ cứu nạn như cháy nổ, đuối nước, thiên tai, cứu hộ nạn nhân.
+- Accident: Tai nạn giao thông nghiêm trọng, gây thiệt hại về người hoặc tài sản.
+- Complaint: Phản ánh, tố cáo, khiếu nại, kiến nghị, tụ tập phản đối liên quan cơ quan nhà nước hoặc doanh nghiệp.
+- Security: Xuyên tạc, công kích nhà nước, lãnh đạo; thông tin tiêu cực liên quan đại hội, đồn đoán, lộ tài liệu mật của Nhà nước Việt Nam.
+- Child: Bảo vệ trẻ em trên không gian mạng.
+- Fiction: Truyện, tiểu thuyết, bài đăng giả tưởng, kể chuyện, giải trí, gameshow, phim truyền hình.
+- SanitationPollution: Ô nhiễm môi trường, vệ sinh an toàn thực phẩm.
+- Cybersecurity: An ninh mạng và tội phạm sử dụng công nghệ cao.
+- Movement: Phong trào toàn dân bảo vệ an ninh trật tự.
+- Other: Nội dung tích cực, trung lập, tổng hợp nhiều tin nhỏ lẻ hoặc không thuộc các nhóm trên.
+
+Chỉ trả về dữ liệu theo schema được yêu cầu, không giải thích thêm."""
+
+OUTPUT_COLUMNS = ["content", "result places", "label", "final result"]
+
 SCHEMA_MAPPING = {
     "RawText": ("raw", None),
-    "LocationResult": ("structured", None),
+    "LocationResult": ("structured", LocationResult),
     "ValidationResult": ("structured", ValidationResult),
     "SeverityResult2Lv": ("structured", SeverityResult2Lv),
     "SeverityResult3Lv": ("structured", SeverityResult3Lv),
@@ -29,79 +73,183 @@ SCHEMA_MAPPING = {
     "SeverityResult4Lv": ("structured", SeverityResult4Lv),
 }
 
+CUSTOM_CSS = """
+.prompt-box textarea {
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    font-size: 13px;
+    line-height: 1.45;
+}
+.status-box textarea {
+    font-weight: 600;
+}
+"""
 
-def json_text(data):
+
+def json_text(data: Any):
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def refresh_location_prompt():
-    return validator.get_prompt("Location")
-
-
-def refresh_event_choices():
+def topic_prompt_defaults():
     validator.update_cache()
-    choices = sorted(validator.cms_location.keys())
-    return gr.update(
-        choices=choices,
-        value=choices[0] if choices else None,
-    )
+    return {topic: validator.prompt_location.get(topic, "") for topic in TOPIC_ORDER}
 
 
-def show_places(event_id):
-    places = validator.get_places(event_id) if event_id else None
-    return places or ""
+def _file_path(file_obj) -> Path | None:
+    if file_obj is None:
+        return None
+    if isinstance(file_obj, (str, Path)):
+        return Path(file_obj)
+    if isinstance(file_obj, dict) and file_obj.get("path"):
+        return Path(file_obj["path"])
+    name = getattr(file_obj, "name", None)
+    return Path(name) if name else None
 
 
-def download_location_prompt(prompt_text):
-    if not prompt_text.strip():
-        return None, "Prompt rỗng, chưa tạo file download."
+def _read_csv(file_obj, content_column: str, row_limit: int) -> list[str]:
+    path = _file_path(file_obj)
+    if path is None:
+        raise ValueError("Chưa chọn file CSV.")
 
-    data = validator._load_json(configs.PROMPT_PATH)
-    data["Location"] = prompt_text
+    content_column = (content_column or "content").strip()
+    if not content_column:
+        raise ValueError("Tên cột content không được để trống.")
 
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1258", "latin-1"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as file:
+                reader = csv.DictReader(file)
+                if not reader.fieldnames:
+                    raise ValueError("File CSV không có header.")
+                if content_column not in reader.fieldnames:
+                    columns = ", ".join(reader.fieldnames)
+                    raise ValueError(
+                        f"Không tìm thấy cột '{content_column}'. Các cột hiện có: {columns}"
+                    )
+
+                contents = []
+                for row in reader:
+                    contents.append(str(row.get(content_column) or "").strip())
+                    if row_limit > 0 and len(contents) >= row_limit:
+                        break
+                return contents
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+
+    raise ValueError(f"Không đọc được file CSV: {last_error}")
+
+
+def _write_result_csv(rows: list[list[Any]]) -> str:
     tmp = tempfile.NamedTemporaryFile(
         mode="w",
-        suffix=".json",
-        prefix="cms_prompt_edited_",
+        suffix=".csv",
+        prefix="cms_batch_result_",
         delete=False,
-        encoding="utf-8",
+        encoding="utf-8-sig",
+        newline="",
     )
     with tmp:
-        json.dump(data, tmp, ensure_ascii=False, indent=4)
+        writer = csv.writer(tmp)
+        writer.writerow(OUTPUT_COLUMNS)
+        writer.writerows(rows)
+    return tmp.name
 
-    return tmp.name, "Đã tạo file prompt đã sửa. Bấm Download để tải về."
+
+def _to_row_value(value: Any):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value)
 
 
-def run_validation(
-    event_id,
-    request_id,
-    content,
-    places_override,
-    location_prompt_text,
+def run_csv_batch(
+    csv_file,
+    content_column,
+    model_name,
+    row_limit,
+    stage_1_prompt,
+    *topic_prompt_values,
 ):
     try:
-        output = validator.validate_cms(
-            title="",
-            description="",
-            display_name="",
-            content=content or "",
-            event_id=event_id or "",
-            request_id=request_id or "",
-            places_override=places_override or None,
-            location_prompt_override=location_prompt_text or None,
-        )
-        mapped_places = validator.get_places(event_id) or ""
-        return (
-            mapped_places,
-            output.location,
-            output.topic,
-            output.result,
-            output.severity,
-            output.description,
-            json_text(output.model_dump()),
-        )
+        row_limit = int(row_limit or 0)
+        model_name = (model_name or validator.model_default).strip()
+        stage_1_prompt = (stage_1_prompt or "").strip()
+        if not stage_1_prompt:
+            return [], None, "Prompt bước 1 đang trống."
+
+        topic_prompts = {
+            topic: (prompt or "").strip()
+            for topic, prompt in zip(TOPIC_ORDER, topic_prompt_values)
+        }
+        contents = _read_csv(csv_file, content_column, row_limit)
+
+        rows = []
+        errors = []
+        for index, content in enumerate(contents, start=1):
+            if not content:
+                rows.append(["", None, "", None])
+                continue
+
+            places_result = None
+            label = ""
+            final_result = None
+
+            first_response = validator.llm_parser(
+                content=content,
+                entity=LocationResult,
+                model_name=model_name,
+                system_prompt=stage_1_prompt,
+                request_id=str(index),
+            )
+
+            first_llm = first_response.get("llm") or {}
+            if not first_llm:
+                errors.append(f"Dòng {index}: lỗi prompt bước 1")
+                rows.append([content, places_result, label, final_result])
+                continue
+
+            places_result = first_llm.get("location")
+            topic = first_llm.get("topic")
+            label = TOPIC_LABELS_VI.get(topic, topic or "")
+
+            if places_result is not True:
+                final_result = False
+                rows.append([content, _to_row_value(places_result), label, final_result])
+                continue
+
+            second_prompt = topic_prompts.get(topic, "")
+            if not second_prompt:
+                errors.append(f"Dòng {index}: chưa có prompt bước 2 cho label {label}")
+                rows.append([content, _to_row_value(places_result), label, final_result])
+                continue
+
+            second_response = validator.llm_parser(
+                content=content,
+                entity=ValidationResult,
+                model_name=model_name,
+                system_prompt=second_prompt,
+                request_id=str(index),
+            )
+            second_llm = second_response.get("llm") or {}
+            if "result" not in second_llm:
+                errors.append(f"Dòng {index}: lỗi prompt bước 2 cho label {label}")
+            else:
+                final_result = second_llm.get("result")
+
+            rows.append([content, _to_row_value(places_result), label, final_result])
+
+        output_file = _write_result_csv(rows)
+        status = f"Đã xử lý {len(rows)} dòng."
+        if errors:
+            status += f" Có {len(errors)} lỗi/nhắc nhở: " + "; ".join(errors[:5])
+            if len(errors) > 5:
+                status += "..."
+
+        return rows, output_file, status
     except Exception:
-        return "", None, None, None, None, "Lỗi runtime", traceback.format_exc()
+        return [], None, traceback.format_exc()
 
 
 def run_prompt_lab(system_prompt, content, schema_name, model_name):
@@ -109,15 +257,6 @@ def run_prompt_lab(system_prompt, content, schema_name, model_name):
     model_name = model_name or validator.model_default
 
     try:
-        if schema_name == "LocationResult":
-            response = validator.llm_parser(
-                content=content,
-                entity=LocationResult,
-                model_name=model_name,
-                system_prompt=system_prompt,
-            )
-            return json_text(response)
-
         if schema_mode == "structured":
             response = validator.llm_parser(
                 content=content,
@@ -138,102 +277,95 @@ def run_prompt_lab(system_prompt, content, schema_name, model_name):
 
 
 def build_demo():
+    prompt_defaults = topic_prompt_defaults()
+
     with gr.Blocks(title="CMS Prompt Studio") as demo:
         gr.Markdown(
             """
             # CMS Prompt Studio
-            Tab 1 dùng đúng luồng `CMS_VALIDATION_URL`, chỉ tập trung vào prompt `Location`.
-            Tab 2 dùng để kiểm thử prompt tùy ý và xem parser trả về dữ liệu thế nào.
+            Upload CSV có cột `content`, chỉnh prompt bước 1 để lấy `result places` và `label`, rồi chỉnh prompt bước 2 theo từng label để tính `final result`.
             """
         )
 
-        with gr.Tab("Location Prompt"):
+        with gr.Tab("CSV Batch"):
             with gr.Row():
-                with gr.Column(scale=1):
-                    event_id = gr.Dropdown(
-                        label="Event ID",
-                        choices=sorted(validator.cms_location.keys()),
-                        value=sorted(validator.cms_location.keys())[0]
-                        if validator.cms_location
-                        else None,
-                        allow_custom_value=True,
+                with gr.Column(scale=3):
+                    csv_file = gr.File(
+                        label="CSV đầu vào",
+                        file_types=[".csv"],
+                        type="filepath",
                     )
-                    request_id = gr.Textbox(label="Request ID")
-                    places_override = gr.Textbox(
-                        label="places_override",
-                        placeholder="Để trống để dùng mapping từ cms_location.json",
-                    )
-                    mapped_places = gr.Textbox(
-                        label="Mapped places từ cms_location.json",
-                        lines=6,
-                        value=show_places(
-                            sorted(validator.cms_location.keys())[0]
-                            if validator.cms_location
-                            else ""
-                        ),
-                        interactive=False,
-                    )
-                    refresh_event = gr.Button("Reload event mapping")
-
                 with gr.Column(scale=2):
-                    location_prompt = gr.Textbox(
-                        label='Chỉnh sửa prompt ở dưới:',
-                        lines=24,
-                        value=validator.get_prompt("Location"),
+                    content_column = gr.Textbox(
+                        label="Tên cột content",
+                        value="content",
                     )
-                    with gr.Row():
-                        download_prompt_btn = gr.Button("Download prompt đã sửa")
-                        run_btn = gr.Button("Nhấn để chạy thử prompt", variant="primary")
-                    prompt_file = gr.File(label="Prompt file", interactive=False)
-                    save_status = gr.Textbox(label="Download status", interactive=False)
+                    model_name = gr.Textbox(
+                        label="Model",
+                        value=validator.model_default,
+                    )
+                    row_limit = gr.Number(
+                        label="Giới hạn số dòng (0 = tất cả)",
+                        value=0,
+                        precision=0,
+                    )
+
+            with gr.Accordion("Prompt bước 1: result places + label", open=True):
+                stage_1_prompt = gr.Textbox(
+                    label="Prompt bước 1",
+                    lines=18,
+                    value=DEFAULT_STAGE_1_PROMPT,
+                    elem_classes=["prompt-box"],
+                )
+
+            with gr.Accordion("Prompt bước 2 theo label", open=True):
+                prompt_inputs = []
+                with gr.Tabs():
+                    for topic in TOPIC_ORDER:
+                        tab_label = TOPIC_LABELS_VI.get(topic, topic)
+                        with gr.Tab(tab_label):
+                            prompt_inputs.append(
+                                gr.Textbox(
+                                    label=f"{tab_label} ({topic})",
+                                    lines=14,
+                                    value=prompt_defaults.get(topic, ""),
+                                    placeholder=(
+                                        "Nhập prompt bước 2 cho label này. "
+                                        "Nếu để trống, final result sẽ không chạy cho label này."
+                                    ),
+                                    elem_classes=["prompt-box"],
+                                )
+                            )
 
             with gr.Row():
-                with gr.Column():
-                    content = gr.Textbox(
-                        label="Content",
-                        lines=12,
-                        placeholder="Điền vào nội dung để phân loại"
-                        )
-                with gr.Column():
-                    location_value = gr.Textbox(label="location", interactive=False)
-                    topic_value = gr.Textbox(
-                        label=f"topic ({', '.join(topic.value for topic in LocalTopic)})",
-                        interactive=False,
-                    )
-                    result_value = gr.Textbox(label="result", interactive=False)
-                    severity_value = gr.Textbox(label="severity", interactive=False)
-                    description_value = gr.Textbox(label="status/description", interactive=False)
-                    raw_output = gr.Code(label="Raw output", language="json")
+                run_btn = gr.Button("Chạy CSV", variant="primary")
+                output_file = gr.File(label="File kết quả", interactive=False)
 
-            event_id.change(show_places, inputs=[event_id], outputs=[mapped_places])
-            refresh_event.click(refresh_event_choices, outputs=[event_id])
-            # refresh_prompt_btn.click(refresh_location_prompt, outputs=[location_prompt])
-            download_prompt_btn.click(
-                download_location_prompt,
-                inputs=[location_prompt],
-                outputs=[prompt_file, save_status],
+            status = gr.Textbox(
+                label="Trạng thái",
+                interactive=False,
+                elem_classes=["status-box"],
+            )
+            result_table = gr.Dataframe(
+                label="Kết quả",
+                headers=OUTPUT_COLUMNS,
+                datatype=["str", "bool", "str", "bool"],
+                interactive=False,
+                wrap=True,
             )
 
             run_btn.click(
-                run_validation,
+                run_csv_batch,
                 inputs=[
-                    event_id,
-                    request_id,
-                    content,
-                    places_override,
-                    location_prompt,
+                    csv_file,
+                    content_column,
+                    model_name,
+                    row_limit,
+                    stage_1_prompt,
+                    *prompt_inputs,
                 ],
-                outputs=[
-                    mapped_places,
-                    location_value,
-                    topic_value,
-                    result_value,
-                    severity_value,
-                    description_value,
-                    raw_output,
-                ],
+                outputs=[result_table, output_file, status],
             )
-
 
         with gr.Tab("Custom Prompt Lab"):
             with gr.Row():
@@ -243,19 +375,26 @@ def build_demo():
                         choices=list(SCHEMA_MAPPING.keys()),
                         value="RawText",
                     )
+                    lab_model_name = gr.Textbox(
+                        label="Model",
+                        value=validator.model_default,
+                    )
                     run_custom_btn = gr.Button("Run prompt", variant="primary")
                 with gr.Column(scale=2):
-                    custom_prompt = gr.Textbox(label="System prompt", lines=18)
+                    custom_prompt = gr.Textbox(
+                        label="System prompt",
+                        lines=18,
+                        elem_classes=["prompt-box"],
+                    )
             with gr.Row():
                 with gr.Column():
                     custom_content = gr.Textbox(label="User content", lines=16)
                 with gr.Column():
                     custom_output = gr.Code(label="Result", language="json")
 
-            model_name = gr.State("gpt-4.1-mini")
             run_custom_btn.click(
                 run_prompt_lab,
-                inputs=[custom_prompt, custom_content, schema_name, model_name],
+                inputs=[custom_prompt, custom_content, schema_name, lab_model_name],
                 outputs=[custom_output],
             )
 
@@ -266,4 +405,4 @@ demo = build_demo()
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=7860, css=CUSTOM_CSS)

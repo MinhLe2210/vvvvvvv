@@ -115,7 +115,7 @@ class CMSValidator:
                     timeout=self.time_out,
                 )
                 parsed = response.output_parsed
-                return {"request_id": request_id, "llm": parsed.model_dump()}
+                return {"request_id": request_id, "llm": parsed.model_dump(mode="json")}
             except Exception:
                 msg = traceback.format_exc()
                 logging_service.error(msg)
